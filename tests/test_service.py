@@ -2569,6 +2569,84 @@ class EscalationPolicyTestCase(unittest.TestCase):
         self.assertEqual(len(r2["escalations"]), 1)
         self.assertEqual(r2["escalations"][0]["policy_version"], 1)
 
+    def test_due_queue_with_many_segments_ignores_sql_variable_limit(self):
+        # 回归测试：旧实现把全部到期段 id 展开为单条 SQL 的 IN 参数，
+        # 到期段数量超过 SQLite 绑定变量上限（SQLITE_LIMIT_VARIABLE_NUMBER）
+        # 时整句报 "too many SQL variables"（API 层 500）；改为 JOIN 关联后
+        # SQL 绑定参数数恒为 1，不再随到期段数量增长
+        if not (
+            hasattr(sqlite3.Connection, "setlimit")
+            and hasattr(sqlite3, "SQLITE_LIMIT_VARIABLE_NUMBER")
+        ):
+            self.skipTest("当前 sqlite3 不支持 setlimit/SQLITE_LIMIT_VARIABLE_NUMBER")
+
+        segment_count = 50
+        low_limit = 8  # 远小于到期段数量：旧 IN 查询必触顶，新查询只用 1 个参数
+
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            service.replace_escalation_policy(
+                conn, source="s1",
+                rules=[{"severity": "critical", "after_seconds": 10}],
+            )
+            segments = []
+            for i in range(segment_count):
+                # 段之间间隔远大于 SILENCE，保证每个事件自成一段
+                seg = service.ingest_event(
+                    conn, source="s1", event_id=f"e{i}",
+                    occurred_ts=1000.0 + i * 1000.0,
+                    severity="critical", silence=SILENCE,
+                )["segment"]
+                segments.append(seg)
+            # 段 0 写两条确认：队列必须只附确认序号最大的一条
+            service.acknowledge_segment(
+                conn, segment_id=segments[0]["id"], operator="first", note="n",
+                expected_revision=1, idempotency_key="k1",
+            )
+            service.acknowledge_segment(
+                conn, segment_id=segments[0]["id"], operator="second", note="n2",
+                expected_revision=1, idempotency_key="k2",
+            )
+
+        # 先复现旧实现的失败：随段数展开的 IN(?) 参数超过下调后的变量上限
+        with read_only_session(self.db_path) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, low_limit)
+            marks = ",".join("?" * segment_count)
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "SELECT MAX(id) FROM segment_acknowledgements "
+                    f"WHERE segment_id IN ({marks})",
+                    [s["id"] for s in segments],
+                )
+
+        # 修复后的到期队列在同一上限内正常返回，全部到期段一个不少
+        with read_only_session(self.db_path) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, low_limit)
+            r = service.list_escalations_due(
+                conn, source="s1", as_of_ts=1_000_000.0
+            )
+
+        self.assertEqual(
+            [e["segment_id"] for e in r["escalations"]],
+            [s["id"] for s in segments],  # 按 (deadline, segment_id) 升序
+        )
+        first = r["escalations"][0]
+        self.assertEqual(first["acknowledgement"]["operator"], "second")
+        self.assertEqual(first["acknowledgement"]["ack_id"], 2)
+        # 其余段未确认 → acknowledgement 为 None
+        self.assertTrue(
+            all(e["acknowledgement"] is None for e in r["escalations"][1:])
+        )
+        # as_of 到期边界保持不变：恰好在最早 deadline 之前为空
+        with read_only_session(self.db_path) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, low_limit)
+            self.assertEqual(
+                service.list_escalations_due(
+                    conn, source="s1", as_of_ts=1009.0
+                )["escalations"],
+                [],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

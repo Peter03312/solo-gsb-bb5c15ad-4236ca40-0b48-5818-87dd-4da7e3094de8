@@ -3,6 +3,7 @@
     pytest tests/test_api.py -v
 """
 import os
+import sqlite3
 import sys
 
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db as db_module  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 
@@ -2233,3 +2235,57 @@ def test_escalations_and_policy_put_are_read_only_for_core_data(client):
     # 升级到期查询不产生确认记录
     seg_id = segs[0]["id"]
     assert client.get(f"/segments/{seg_id}/acknowledgements").json() == []
+
+
+def test_escalations_many_due_segments_survive_low_sql_variable_limit(client, monkeypatch):
+    # 回归测试：旧实现把全部到期段 id 展开为单条 SQL 的 IN 参数，到期段超过
+    # SQLite 绑定变量上限（SQLITE_LIMIT_VARIABLE_NUMBER）后 GET /escalations
+    # 报 500；改为 JOIN 关联确认审计后绑定参数数恒为 1，队列不受该上限影响。
+    if not (
+        hasattr(sqlite3.Connection, "setlimit")
+        and hasattr(sqlite3, "SQLITE_LIMIT_VARIABLE_NUMBER")
+    ):
+        pytest.skip("当前 sqlite3 不支持 setlimit/SQLITE_LIMIT_VARIABLE_NUMBER")
+
+    segment_count = 50
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 30}])
+    segment_ids = []
+    for i in range(segment_count):
+        # 测试夹具 silence=60s：事件间隔 2 分钟（严格大于静默间隔），各自成段
+        minute = 2 * i
+        seg = _post(
+            client, "gw-01", f"evt-{i:03d}",
+            f"2026-09-20T{8 + minute // 60:02d}:{minute % 60:02d}:00Z",
+            "critical",
+        )["segment"]
+        segment_ids.append(seg["id"])
+
+    # 第一段写两条确认：队列必须只附确认序号最大的一条
+    _ack(client, segment_ids[0], operator="ops-a", key="k1")
+    _ack(client, segment_ids[0], operator="ops-b", key="k2")
+
+    # 下调后续连接（即只读查询连接）的 SQLite 绑定变量上限到个位数：
+    # 旧 IN(?,?,...) 查询必触顶，修复后的单参数 JOIN 查询不受影响
+    real_connect = db_module.connect
+
+    def connect_with_low_limit(db_path):
+        conn = real_connect(db_path)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 8)
+        return conn
+
+    monkeypatch.setattr(db_module, "connect", connect_with_low_limit)
+
+    resp = _escalations(
+        client, source="gw-01", as_of="2026-09-21T00:00:00Z"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    escalations = body["escalations"]
+    assert [e["segment_id"] for e in escalations] == segment_ids
+    assert escalations[0]["acknowledgement"]["operator"] == "ops-b"
+    assert escalations[0]["acknowledgement"]["ack_id"] == 2
+    assert all(e["acknowledgement"] is None for e in escalations[1:])
+    assert all(e["policy_version"] == 1 for e in escalations)
+    # (deadline, segment_id) 升序：deadline 随起始时间递增
+    deadlines = [e["deadline"] for e in escalations]
+    assert deadlines == sorted(deadlines)

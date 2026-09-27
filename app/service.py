@@ -106,7 +106,9 @@
   到期队列：段按 max_severity 与规则精确匹配，deadline = started_at +
   after_seconds（微秒精度），仅返回 as_of >= deadline 的段，附最近一次
   人工确认（无则 None）与策略 version，按 (deadline, segment_id) 升序；
-  来源无策略/未知来源均返回空列表；仅执行 SELECT，不改写任何表。
+  到期段与确认审计以 LEFT JOIN（相关子查询按段取 MAX(id)）关联，不随到期
+  段数量展开绑定参数，到期队列不受 SQLite 变量数上限影响；来源无策略/未知
+  来源均返回空列表；仅执行 SELECT，不改写任何表。
 """
 from __future__ import annotations
 
@@ -1598,6 +1600,9 @@ def list_escalations_due(
       as_of >= deadline 的段（恰好等于 deadline 也返回）；
     - 每项附该段最近一次人工确认（ack_id 最大一条；没有则为 None）及
       查询快照中的策略 version；按 (deadline, segment_id) 升序；
+    - 到期段与确认审计通过 LEFT JOIN 关联（相关子查询按每段取 MAX(id)），
+      不把到期段 id 展开为 IN 参数——无论到期段多少，SQL 绑定参数数恒为 1，
+      到期队列不受 SQLite 变量数上限（SQLITE_LIMIT_VARIABLE_NUMBER）影响；
     - 仅执行 SELECT，不改写任何表；调用方应使用 read_only_session。
     """
     policy = conn.execute(
@@ -1605,14 +1610,36 @@ def list_escalations_due(
     ).fetchone()
     policy_version = policy["version"] if policy is not None else None
 
+    # 段匹配规则与最近一次确认在同一条 SELECT 内联读完成：
+    # - 到期判定（微秒精度）仍在 Python 侧逐段进行，SQL 只负责把该来源
+    #   命中规则的候选段与其确认序号最大的一条审计记录关联起来；
+    # - LEFT JOIN 的相关子查询每段取 MAX(id)，未确认段的 ack_* 列为 NULL；
+    #   不出现随段数增长的 IN (...) 参数列表，绑定参数恒为 source 一个，
+    #   规避大量到期段超过 SQLite 绑定变量上限导致的查询失败；
+    # - idx_segment_ack_segment(segment_id, id) 覆盖子查询，按段取最大值
+    #   为索引内的一跳查找，不做全表扫描；全部读取共享同一只读快照。
     rows = conn.execute(
         """
         SELECT s.id AS segment_id, s.source AS source, s.start_ts AS start_ts,
                s.max_severity AS max_severity,
-               r.after_seconds AS after_seconds
+               r.after_seconds AS after_seconds,
+               a.id               AS ack_id,
+               a.segment_id       AS ack_segment_id,
+               a.operator         AS ack_operator,
+               a.note             AS ack_note,
+               a.expected_revision AS ack_expected_revision,
+               a.segment_revision AS ack_segment_revision,
+               a.idempotency_key  AS ack_idempotency_key,
+               a.created_at       AS ack_created_at
         FROM segments AS s
         JOIN escalation_policy_rules AS r
           ON r.source = s.source AND r.severity = s.max_severity
+        LEFT JOIN segment_acknowledgements AS a
+          ON a.id = (
+              SELECT MAX(id)
+              FROM segment_acknowledgements
+              WHERE segment_id = s.id
+          )
         WHERE s.source = ?
         ORDER BY s.id
         """,
@@ -1630,26 +1657,20 @@ def list_escalations_due(
             continue
         due.append((deadline_dt.timestamp(), row["segment_id"], row))
 
-    # 最近一次确认：同一只读快照内仅在已到期段集合中按段取 ack_id 最大的一条
-    latest_acks: dict[int, dict] = {}
-    if due:
-        due_ids = [segment_id for _, segment_id, _ in due]
-        marks = ",".join("?" * len(due_ids))
-        ack_rows = conn.execute(
-            f"""
-            SELECT a.*
-            FROM segment_acknowledgements AS a
-            JOIN (
-                SELECT segment_id, MAX(id) AS max_id
-                FROM segment_acknowledgements
-                WHERE segment_id IN ({marks})
-                GROUP BY segment_id
-            ) AS latest
-              ON latest.max_id = a.id
-            """,
-            due_ids,
-        ).fetchall()
-        latest_acks = {r["segment_id"]: _row_to_acknowledgement(r) for r in ack_rows}
+    def _latest_ack(row: sqlite3.Row) -> dict | None:
+        # LEFT JOIN 未命中确认记录时 ack_id 为 NULL → 该段未确认
+        if row["ack_id"] is None:
+            return None
+        return {
+            "ack_id": row["ack_id"],
+            "segment_id": row["ack_segment_id"],
+            "operator": row["ack_operator"],
+            "note": row["ack_note"],
+            "expected_revision": row["ack_expected_revision"],
+            "segment_revision": row["ack_segment_revision"],
+            "idempotency_key": row["ack_idempotency_key"],
+            "created_at": _iso(row["ack_created_at"]),
+        }
 
     items = [
         {
@@ -1659,7 +1680,7 @@ def list_escalations_due(
             "started_at": _iso(row["start_ts"]),
             "deadline": _iso(deadline_ts),
             "policy_version": policy_version,
-            "acknowledgement": latest_acks.get(segment_id),
+            "acknowledgement": _latest_ack(row),
         }
         for deadline_ts, segment_id, row in sorted(
             due, key=lambda entry: (entry[0], entry[1])
