@@ -2569,6 +2569,58 @@ class EscalationPolicyTestCase(unittest.TestCase):
         self.assertEqual(len(r2["escalations"]), 1)
         self.assertEqual(r2["escalations"][0]["policy_version"], 1)
 
+    @unittest.skipUnless(
+        hasattr(sqlite3.Connection, "setlimit"),
+        "需要 Python 3.11+ 的 Connection.setlimit 调低 SQLite 变量上限",
+    )
+    def test_due_queue_not_limited_by_sqlite_variable_number(self):
+        # 回归：到期段与确认审计的关联曾把全部到期段 ID 展开为单条 SQL 的
+        # IN 参数，段数超过 SQLite 绑定变量上限后查询报错（API 层表现为
+        # GET /escalations 500）。这里把连接的变量上限调低复现该场景：
+        # 旧实现会抛 sqlite3.OperationalError: too many SQL variables
+        variable_limit = 25
+        segment_count = variable_limit * 2  # 到期段数远超调低后的变量上限
+        first_seg_id = None
+        for i in range(segment_count):
+            seg = self._submit(
+                "s1", f"e{i}", 1000.0 + i * (SILENCE + 1), "critical"
+            )
+            if first_seg_id is None:
+                first_seg_id = seg["id"]
+        self._put("s1", [{"severity": "critical", "after_seconds": 1}])
+        # 首段确认两次：验证调低上限后仍只附确认序号最大的一条
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            service.acknowledge_segment(
+                conn, segment_id=first_seg_id, operator="a", note="first",
+                expected_revision=1, idempotency_key="k1",
+            )
+            service.acknowledge_segment(
+                conn, segment_id=first_seg_id, operator="b", note="second",
+                expected_revision=1, idempotency_key="k2",
+            )
+
+        with read_only_session(self.db_path) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+            result = service.list_escalations_due(
+                conn, source="s1", as_of_ts=1_000_000.0
+            )
+
+        escalations = result["escalations"]
+        self.assertEqual(len(escalations), segment_count)
+        # (deadline, segment_id) 升序：各段 deadline 随 started_at 递增，
+        # 与 segment_id 次序一致
+        ids = [e["segment_id"] for e in escalations]
+        self.assertEqual(ids, sorted(ids))
+        # 首段附最近一次确认（ack_id 最大），其余未确认段为 None
+        first_item = escalations[ids.index(first_seg_id)]
+        self.assertEqual(first_item["acknowledgement"]["operator"], "b")
+        self.assertEqual(first_item["acknowledgement"]["note"], "second")
+        for item in escalations:
+            if item["segment_id"] != first_seg_id:
+                self.assertIsNone(item["acknowledgement"])
+            self.assertEqual(item["policy_version"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

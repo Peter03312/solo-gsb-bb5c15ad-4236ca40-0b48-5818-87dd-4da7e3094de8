@@ -4,6 +4,7 @@
 """
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -2233,3 +2234,40 @@ def test_escalations_and_policy_put_are_read_only_for_core_data(client):
     # 升级到期查询不产生确认记录
     seg_id = segs[0]["id"]
     assert client.get(f"/segments/{seg_id}/acknowledgements").json() == []
+
+
+def test_escalations_many_due_segments_survive_low_variable_limit(
+    client, monkeypatch
+):
+    # 回归：到期段与确认审计的关联曾把全部到期段 ID 展开为单条 SQL 的
+    # IN 参数，段数超过 SQLite 绑定变量上限后 GET /escalations 报 500。
+    # 这里把连接的变量上限调低复现该场景（等效于到期段数超过默认上限），
+    # 修复后绑定变量数与到期段数无关，接口正常返回
+    import sqlite3
+
+    from app import db as app_db
+
+    variable_limit = 25
+    real_connect = app_db.connect
+
+    def limited_connect(db_path):
+        conn = real_connect(db_path)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+        return conn
+
+    monkeypatch.setattr(app_db, "connect", limited_connect)
+
+    segment_count = variable_limit * 2  # 到期段数远超调低后的变量上限
+    base = datetime(2026, 9, 20, 8, 0, 0, tzinfo=timezone.utc)
+    for i in range(segment_count):
+        occurred = (base + timedelta(minutes=2 * i)).isoformat()
+        _post(client, "gw-01", f"e{i}", occurred, "critical")
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 1}])
+
+    resp = _escalations(client, source="gw-01", as_of="2026-09-21T00:00:00Z")
+    assert resp.status_code == 200
+    escalations = resp.json()["escalations"]
+    assert len(escalations) == segment_count
+    ids = [e["segment_id"] for e in escalations]
+    assert ids == sorted(ids)  # (deadline, segment_id) 升序保持不变
+    assert all(e["acknowledgement"] is None for e in escalations)

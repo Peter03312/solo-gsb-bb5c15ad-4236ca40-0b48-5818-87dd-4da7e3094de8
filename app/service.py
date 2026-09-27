@@ -106,6 +106,8 @@
   到期队列：段按 max_severity 与规则精确匹配，deadline = started_at +
   after_seconds（微秒精度），仅返回 as_of >= deadline 的段，附最近一次
   人工确认（无则 None）与策略 version，按 (deadline, segment_id) 升序；
+  到期段与确认审计的关联按来源单条 JOIN 完成，不展开 IN 参数，到期段
+  数量不受 SQLite 绑定变量上限影响；
   来源无策略/未知来源均返回空列表；仅执行 SELECT，不改写任何表。
 """
 from __future__ import annotations
@@ -1598,6 +1600,8 @@ def list_escalations_due(
       as_of >= deadline 的段（恰好等于 deadline 也返回）；
     - 每项附该段最近一次人工确认（ack_id 最大一条；没有则为 None）及
       查询快照中的策略 version；按 (deadline, segment_id) 升序；
+    - 到期段与确认审计的关联走按来源过滤的单条 JOIN，不把段 ID 展开为
+      IN 参数，到期段数量不受 SQLite 绑定变量上限影响；
     - 仅执行 SELECT，不改写任何表；调用方应使用 read_only_session。
     """
     policy = conn.execute(
@@ -1630,24 +1634,27 @@ def list_escalations_due(
             continue
         due.append((deadline_dt.timestamp(), row["segment_id"], row))
 
-    # 最近一次确认：同一只读快照内仅在已到期段集合中按段取 ack_id 最大的一条
+    # 最近一次确认：同一只读快照内按"当前属于该来源的段"关联确认审计，
+    # 单条 JOIN 取每段 ack_id 最大的一条。不把到期段 ID 展开为 IN 参数
+    # （绑定变量数与到期段数无关），到期队列因此不受 SQLite 绑定变量上限
+    # （SQLITE_MAX_VARIABLE_NUMBER）影响；确认记录按 segment_id 关联，
+    # 未到期段的记录取回后不会被引用，已删除段的确认记录本就不入队
     latest_acks: dict[int, dict] = {}
     if due:
-        due_ids = [segment_id for _, segment_id, _ in due]
-        marks = ",".join("?" * len(due_ids))
         ack_rows = conn.execute(
-            f"""
+            """
             SELECT a.*
             FROM segment_acknowledgements AS a
             JOIN (
-                SELECT segment_id, MAX(id) AS max_id
-                FROM segment_acknowledgements
-                WHERE segment_id IN ({marks})
-                GROUP BY segment_id
+                SELECT a2.segment_id, MAX(a2.id) AS max_id
+                FROM segment_acknowledgements AS a2
+                JOIN segments AS s ON s.id = a2.segment_id
+                WHERE s.source = ?
+                GROUP BY a2.segment_id
             ) AS latest
               ON latest.max_id = a.id
             """,
-            due_ids,
+            (source,),
         ).fetchall()
         latest_acks = {r["segment_id"]: _row_to_acknowledgement(r) for r in ack_rows}
 
